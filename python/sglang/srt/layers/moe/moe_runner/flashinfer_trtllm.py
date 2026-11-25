@@ -178,9 +178,15 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    from sglang.srt.layers.quantization.fp4_utils import (
+        fp4_quantize,
+        nvfp4_batch_invariant_eligible,
+        nvfp4_quantize_per_token_linear,
+    )
 else:
     fp4_quantize = None
+    nvfp4_quantize_per_token_linear = None
+    nvfp4_batch_invariant_eligible = None
 
 _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
     tuple, dict[str, torch.Tensor]
@@ -1939,13 +1945,23 @@ def quantize_hidden_states_fp4(
 
     # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
     # Only the block scales are computed at runtime
-    hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-        hidden_states,
-        input_scale_quant,
-        16,  # sf_vec_size
-        False,  # use_ue8m0
-        False,  # is_sf_swizzled_layout
-    )
+    if nvfp4_batch_invariant_eligible(hidden_states):
+        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+            hidden_states,
+            input_scale_quant,
+            16,  # sf_vec_size
+            False,  # use_ue8m0
+            False,  # is_sf_swizzled_layout
+            batch_invariant=True,
+        )
+    else:
+        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+            hidden_states,
+            input_scale_quant,
+            16,  # sf_vec_size
+            False,  # use_ue8m0
+            False,  # is_sf_swizzled_layout
+        )
 
     seq_len, hidden_size = hidden_states.shape
     hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
@@ -2030,8 +2046,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
     elif quant_info.use_per_token_activation:
-        from flashinfer import SfLayout, nvfp4_quantize
-
         e4m3_max = 448.0
         if (
             envs.FLASHINFER_NVFP4_4OVER6.get()
@@ -2045,12 +2059,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             dtype=torch.float32,
             device=hidden_states.device,
         )
-        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            global_scale_inv,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize_per_token_linear(
+            hidden_states, global_scale_inv
         )
 
         seq_len, hidden_size = hidden_states.shape

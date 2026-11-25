@@ -54,7 +54,10 @@ try:
         create_communication,
     )
 
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    from sglang.srt.layers.quantization.fp4_utils import (
+        fp4_quantize,
+        nvfp4_batch_invariant_eligible,
+    )
 
     use_flashinfer = True
 except ImportError:
@@ -393,7 +396,19 @@ class FlashinferDispatcher(BaseDispatcher):
             global_scale = (self.quant_config or {}).get("input_global_scale", None)
             assert global_scale is not None
             if x.shape[0] > 0:
-                x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+                if nvfp4_batch_invariant_eligible(x):
+                    x, x_sf = fp4_quantize(
+                        x,
+                        global_scale,
+                        is_sf_swizzled_layout=False,
+                        batch_invariant=True,
+                    )
+                else:
+                    x, x_sf = fp4_quantize(
+                        x,
+                        global_scale,
+                        is_sf_swizzled_layout=False,
+                    )
             else:
                 x = torch.zeros(
                     0, self.hidden_size // 2, dtype=torch.uint8, device=x.device

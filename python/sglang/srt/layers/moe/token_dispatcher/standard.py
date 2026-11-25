@@ -45,9 +45,13 @@ try:
     from sglang.srt.layers.quantization.fp4_utils import (
         fp4_quantize as fp4_quantize_flashinfer,
     )
+    from sglang.srt.layers.quantization.fp4_utils import (
+        nvfp4_batch_invariant_eligible,
+    )
 except ImportError:
     fp4_quantize_flashinfer = None
     nvfp4_block_scale_interleave_flashinfer = None
+    nvfp4_batch_invariant_eligible = None
 
 
 class StandardDispatchOutput(NamedTuple):
@@ -212,9 +216,19 @@ class StandardDispatcher(BaseDispatcher):
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 if hidden_states.shape[0] > 0:
-                    x, x_sf = fp4_quantize_flashinfer(
-                        hidden_states, global_scale, is_sf_swizzled_layout=False
-                    )
+                    if nvfp4_batch_invariant_eligible(hidden_states):
+                        x, x_sf = fp4_quantize_flashinfer(
+                            hidden_states,
+                            global_scale,
+                            is_sf_swizzled_layout=False,
+                            batch_invariant=True,
+                        )
+                    else:
+                        x, x_sf = fp4_quantize_flashinfer(
+                            hidden_states,
+                            global_scale,
+                            is_sf_swizzled_layout=False,
+                        )
                 else:
                     x_col = hidden_states.shape[1]
                     x = torch.zeros(

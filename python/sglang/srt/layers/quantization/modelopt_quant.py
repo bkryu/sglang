@@ -37,8 +37,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_gemm_batch_invariant_eligible,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
+    nvfp4_batch_invariant_eligible,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -163,6 +165,21 @@ def fp4_gemm(
     # Use the remapping logic to convert SGLang backend names to FlashInfer API names
     backend = fp4_backend.get_flashinfer_backend()
     if quant_mode == "w4a4":
+        # weight is the transpose of the row-major (N, K / 2) weight.
+        n, k = weight.shape[1], weight.shape[0] * 2
+        if fp4_gemm_batch_invariant_eligible(input.device, n, k):
+            # The deterministic mode's batch-invariant GEMM takes precedence over
+            # the configured backend; the weight was prepared in its 128x4 layout.
+            return flashinfer_fp4_gemm(
+                input,
+                weight,
+                input_sf,
+                weight_sf,
+                alpha,
+                out_dtype,
+                backend="auto",
+                batch_invariant=True,
+            )
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
@@ -1959,7 +1976,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 "Use --fp4-gemm-backend marlin on SM80-SM90."
             )
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+        # The deterministic mode's batch-invariant GEMM takes the 128x4 layout
+        # below whatever backend is configured; its shape rules are read on the
+        # padded weight, the shape the GEMM sees.
+        if (
+            get_fp4_gemm_runner_backend().is_flashinfer_trtllm()
+            and not fp4_gemm_batch_invariant_eligible(
+                layer.weight.device,
+                round_up_to_multiple(layer.weight.shape[0], FP4_GEMM_ALIGNMENT),
+                round_up_to_multiple(layer.weight.shape[1] * 2, FP4_GEMM_ALIGNMENT),
+            )
+        ):
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -2129,7 +2156,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
                 if self.quant_config.is_awq:
                     x = x * layer.pre_quant_scale
-                x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+                if nvfp4_batch_invariant_eligible(x):
+                    x_fp4, x_scale_interleaved = fp4_quantize(
+                        x,
+                        layer.input_scale_inv,
+                        batch_invariant=True,
+                    )
+                else:
+                    x_fp4, x_scale_interleaved = fp4_quantize(
+                        x,
+                        layer.input_scale_inv,
+                    )
                 x_m, _ = x.shape
                 output_dtype = x.dtype
 

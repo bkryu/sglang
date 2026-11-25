@@ -420,7 +420,10 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsW4A4Fp4,
     )
-    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.fp4_utils import (
+        get_fp4_gemm_runner_backend,
+        use_flashinfer_bi_nvfp4,
+    )
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
     gate_up, down = mlp.gate_up_proj, mlp.down_proj
@@ -439,6 +442,10 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
         return
     # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
     if get_fp4_gemm_runner_backend().is_marlin():
+        return
+    # The fused producer is not one of the deterministic mode's batch-invariant
+    # kernels; the mode keeps the separate act_and_mul + quantize.
+    if use_flashinfer_bi_nvfp4(torch.device("cuda", torch.cuda.current_device())):
         return
     # The fused kernel never writes the scale padding, which exists when K % 64 != 0.
     if mlp.down_proj.input_size_per_partition % 64 != 0:

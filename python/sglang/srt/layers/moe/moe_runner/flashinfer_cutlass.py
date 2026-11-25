@@ -27,6 +27,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_quantize,
+    nvfp4_batch_invariant_eligible,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -268,6 +272,15 @@ def _prepare_input(
         output_col = x.shape[1]
         if x_sf is not None and runner_config.is_gated:
             output_col *= 2
+        elif x_sf is None and x.is_floating_point():
+            if nvfp4_batch_invariant_eligible(x):
+                # The deterministic mode quantizes with FlashInfer's batch-invariant
+                # kernel (128x4 scales) in place of the MoE kernel's internal quantizer;
+                # the output width stays the unpacked hidden size.
+                assert quant_info.quant_scales is not None
+                x, x_sf = fp4_quantize(
+                    x, quant_info.quant_scales[0], batch_invariant=True
+                )
     else:
         assert quant_info.quant_type == "bf16"
         output_dtype = quant_info.output_dtype or x.dtype

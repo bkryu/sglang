@@ -445,7 +445,11 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    from sglang.srt.layers.quantization.fp4_utils import (
+        fp4_quantize,
+        nvfp4_batch_invariant_eligible,
+        nvfp4_quantize_per_token_linear,
+    )
 
     assert runner_config.activation in (
         "silu",
@@ -466,26 +470,29 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         topk_ids = topk_ids.to(torch.int32)
 
     if quant_info.use_per_token_activation:
-        from flashinfer import SfLayout, nvfp4_quantize
-
-        x_fp4, x_sf, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            quant_info.a1_scale,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
+        x_fp4, x_sf, per_token_scale = nvfp4_quantize_per_token_linear(
+            hidden_states, quant_info.a1_scale
         )
     elif quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         x_sf = None
         per_token_scale = None
     else:
-        x_fp4, x_sf = fp4_quantize(
-            hidden_states,
-            quant_info.a1_scale,
-            sf_vec_size=_FP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=False,
-        )
+        if nvfp4_batch_invariant_eligible(hidden_states):
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+                batch_invariant=True,
+            )
+        else:
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+            )
         per_token_scale = None
 
     if quant_info.quant_mode != "w4a16":
@@ -532,7 +539,11 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    from sglang.srt.layers.quantization.fp4_utils import (
+        fp4_quantize,
+        nvfp4_batch_invariant_eligible,
+        nvfp4_quantize_per_token_linear,
+    )
 
     # Eager prefill uses all-gather, including idle ranks in a prefill batch.
     # Preserve the standard combine format so the dispatcher reduce-scatters it.
@@ -574,22 +585,25 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         per_token_scale = None
     else:
         if quant_info.use_per_token_activation:
-            from flashinfer import SfLayout, nvfp4_quantize
-
-            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
-                hidden_states,
-                quant_info.a1_scale,
-                sfLayout=SfLayout.layout_linear,
-                per_token_activation=True,
-                backend="cute-dsl",
+            x_fp4, x_sf, per_token_scale = nvfp4_quantize_per_token_linear(
+                hidden_states, quant_info.a1_scale
             )
         else:
-            x_fp4, x_sf = fp4_quantize(
-                hidden_states,
-                quant_info.a1_scale,
-                sf_vec_size=_FP4_SF_VEC_SIZE,
-                is_sf_swizzled_layout=False,
-            )
+            if nvfp4_batch_invariant_eligible(hidden_states):
+                x_fp4, x_sf = fp4_quantize(
+                    hidden_states,
+                    quant_info.a1_scale,
+                    sf_vec_size=_FP4_SF_VEC_SIZE,
+                    is_sf_swizzled_layout=False,
+                    batch_invariant=True,
+                )
+            else:
+                x_fp4, x_sf = fp4_quantize(
+                    hidden_states,
+                    quant_info.a1_scale,
+                    sf_vec_size=_FP4_SF_VEC_SIZE,
+                    is_sf_swizzled_layout=False,
+                )
             per_token_scale = None
 
         seq_len, hidden_size = hidden_states.shape

@@ -12,8 +12,8 @@ from sglang.test.test_utils import CustomTestCase
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
-# B200 runs MXFP8 quantization and GEMM through FlashInfer's batch-invariant kernels.
-register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-b200")
+# B200 runs MXFP8 and NVFP4 quantization and GEMMs through FlashInfer's batch-invariant kernels.
+register_cuda_ci(est_time=60, stage="nightly", runner_config="4-gpu-b200")
 register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -304,6 +304,99 @@ class TestBatchInvariantOps(CustomTestCase):
                 torch.testing.assert_close(out, pinned, rtol=0, atol=0)
                 bi_kernels = [k for k in names if "batch_invariant" in k]
                 self.assertFalse(bi_kernels, bi_kernels)
+
+    def test_flashinfer_nvfp4_batch_invariance(self):
+        """On SM100-family parts the deterministic mode runs NVFP4 activation
+        quantization and the dense NVFP4 GEMM on FlashInfer's batch-invariant
+        kernels: the wrapper's bytes are the direct call's, and a row's codes,
+        scales and GEMM output do not depend on the rows around it."""
+        from sglang.srt.layers.quantization import fp4_utils
+        from sglang.srt.layers.quantization.modelopt_quant import fp4_gemm
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        with set_batch_invariant_mode(True):
+            if not fp4_utils.use_flashinfer_bi_nvfp4(device):
+                self.skipTest("FlashInfer batch-invariant NVFP4 is unavailable")
+            import flashinfer
+
+            bi = fp4_utils.use_flashinfer_bi_nvfp4(device)
+            generator = torch.Generator(device=device_type).manual_seed(0)
+            K, N = 4096, 2048
+            x = torch.randn(257, K, dtype=torch.bfloat16, generator=generator)
+            gs = (448.0 * 6.0 / x.float().abs().max()).reshape(1)
+            gs_inv = torch.full((1,), 1.0 / (448.0 * 6.0), dtype=torch.float32)
+            same = lambda a, b: torch.testing.assert_close(a, b, rtol=0, atol=0)
+            u8 = lambda t: t.view(torch.uint8)
+            # The wrapper under the mode: the bytes of the direct FlashInfer call,
+            # dense 128x4 and MoE linear scale layouts, and the per-token entry.
+            for swizzled in (True, False):
+                q, sf = fp4_utils.fp4_quantize(
+                    x, gs, is_sf_swizzled_layout=swizzled, batch_invariant=bi
+                )
+                q_ref, sf_ref = flashinfer.fp4_quantize(
+                    x,
+                    gs,
+                    is_sf_swizzled_layout=swizzled,
+                    backend="auto",
+                    batch_invariant=True,
+                )
+                same(q, q_ref)
+                same(u8(sf), u8(sf_ref))
+            q, sf, pts = fp4_utils.nvfp4_quantize_per_token_linear(x, gs_inv)
+            q_ref, sf_ref, pts_ref = flashinfer.nvfp4_quantize(
+                x,
+                gs_inv,
+                sfLayout=flashinfer.SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="auto",
+                batch_invariant=True,
+            )
+            same(q, q_ref), same(u8(sf), u8(sf_ref)), same(pts, pts_ref)
+            # Row 0 alone against row 0 inside a batch: codes in both layouts, the
+            # row's scales in the linear (row-addressed) layout, the per-token scale.
+            q1, sf1 = fp4_utils.fp4_quantize(
+                x[:1], gs, is_sf_swizzled_layout=False, batch_invariant=bi
+            )
+            q1s, _ = fp4_utils.fp4_quantize(x[:1], gs, batch_invariant=bi)
+            p1, psf1, pts1 = fp4_utils.nvfp4_quantize_per_token_linear(x[:1], gs_inv)
+            for m in (16, 64, 257):
+                q, sf = fp4_utils.fp4_quantize(
+                    x[:m], gs, is_sf_swizzled_layout=False, batch_invariant=bi
+                )
+                qs, _ = fp4_utils.fp4_quantize(x[:m], gs, batch_invariant=bi)
+                p, psf, pts = fp4_utils.nvfp4_quantize_per_token_linear(x[:m], gs_inv)
+                same(q[:1], q1), same(u8(sf)[:1], u8(sf1)), same(qs[:1], q1s)
+                same(p[:1], p1), same(u8(psf)[:1], u8(psf1)), same(pts[:1], pts1)
+            # The dense GEMM path, the weight in the 128x4 layout the loader
+            # prepares under the mode.
+            w = torch.randn(N, K, dtype=torch.bfloat16, generator=generator)
+            gw = (448.0 * 6.0 / w.float().abs().max()).reshape(1)
+            w_q, w_sf = fp4_utils.fp4_quantize(w, gw, batch_invariant=bi)
+            alpha = (1.0 / (gs * gw)).to(torch.float32)
+
+            def dense(rows):
+                x_q, x_sf = fp4_utils.fp4_quantize(rows, gs, batch_invariant=bi)
+                return fp4_gemm(x_q, w_q.T, x_sf, w_sf.T, alpha, torch.bfloat16, N)
+
+            out1 = dense(x[:1])
+
+            for m in (64, 257):
+                same(dense(x[:m])[:1], out1)
+
+            # The bit comparison is blind where the other kernels happen to be
+
+            # invariant too: the path must launch the batch-invariant quantizer and
+
+            # GEMM, two distinct kernels, at every M.
+
+            for m in (1, 64, 257):
+                names = _cuda_kernel_names(lambda m=m: dense(x[:m]))
+
+                bi_kernels = [k for k in names if "batch_invariant" in k]
+
+                self.assertEqual(len(bi_kernels), 2, names)
+
+                self.assertEqual(len(set(bi_kernels)), 2, names)
 
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""

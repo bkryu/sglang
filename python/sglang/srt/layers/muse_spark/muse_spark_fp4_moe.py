@@ -583,7 +583,9 @@ class MuseSpark1xFp4Experts(nn.Module):
         elif self.quant_config.use_per_token_activation:
             # Calibration-free checkpoints ship activation scales of exactly 1.0,
             # so the scale has to be computed per token at runtime instead.
-            from flashinfer import SfLayout, nvfp4_quantize
+            from sglang.srt.layers.quantization.fp4_utils import (
+                nvfp4_quantize_per_token_linear,
+            )
 
             global_scale_inv = torch.full(
                 (1,),
@@ -591,12 +593,8 @@ class MuseSpark1xFp4Experts(nn.Module):
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
-            hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
-                hidden_states,
-                global_scale_inv,
-                sfLayout=SfLayout.layout_linear,
-                per_token_activation=True,
-                backend="cute-dsl",
+            hs_fp4_bytes, hs_sf_bytes, per_token_scale = (
+                nvfp4_quantize_per_token_linear(hidden_states, global_scale_inv)
             )
             seq_len, hidden_size = hidden_states.shape
             hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)

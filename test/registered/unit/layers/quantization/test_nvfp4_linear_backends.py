@@ -11,6 +11,8 @@ from unittest import mock
 import torch
 from flashinfer import fp4_quantize
 
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
@@ -168,6 +170,37 @@ class TestNvFp4LinearBackends(CustomTestCase):
 
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
+
+    def test_deterministic_mode_fallbacks(self):
+        """Under the deterministic mode a row outside the batch-invariant quantizer's
+        contract (over 128 KiB), FlashInfer's 4over6 env and the opt-out each give
+        the mode-off path's bytes."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        with set_batch_invariant_mode(True):
+            if not fp4_utils.use_flashinfer_bi_nvfp4(device):
+                self.skipTest("FlashInfer batch-invariant NVFP4 is unavailable")
+        torch.manual_seed(3)
+        gs = torch.ones(1, device="cuda")
+        x = torch.randn((16, 4096), device="cuda", dtype=torch.bfloat16) / 10
+        x_long = torch.randn((4, 66560), device="cuda", dtype=torch.bfloat16) / 10
+
+        def quant(t):
+            return fp4_utils.fp4_quantize(
+                t, gs, batch_invariant=fp4_utils.nvfp4_batch_invariant_eligible(t)
+            )
+
+        off, off_long = quant(x), quant(x_long)
+        with set_batch_invariant_mode(True):
+            on_long = quant(x_long)
+            with envs.FLASHINFER_NVFP4_4OVER6.override(True):
+                on_4over6 = quant(x)
+            with envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(False):
+                on_optout = quant(x)
+        for on, ref in ((on_long, off_long), (on_4over6, off), (on_optout, off)):
+            torch.testing.assert_close(on[0], ref[0], rtol=0, atol=0)
+            torch.testing.assert_close(
+                on[1].view(torch.uint8), ref[1].view(torch.uint8), rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":

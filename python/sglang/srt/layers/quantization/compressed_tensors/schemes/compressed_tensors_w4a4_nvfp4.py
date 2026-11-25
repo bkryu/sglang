@@ -17,8 +17,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_gemm_batch_invariant_eligible,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
+    nvfp4_batch_invariant_eligible,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
@@ -101,7 +103,17 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+        # The deterministic mode's batch-invariant GEMM takes the swizzled 128x4
+        # layout below whatever backend is configured (its shape rules read on
+        # the unpadded weight: this scheme pads nothing).
+        if (
+            get_fp4_gemm_runner_backend().is_flashinfer_trtllm()
+            and not fp4_gemm_batch_invariant_eligible(
+                layer.weight_packed.device,
+                layer.weight_packed.shape[0],
+                layer.weight_packed.shape[1] * 2,
+            )
+        ):
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -154,7 +166,17 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             output_shape = [*x.shape[:-1], w_n]
             x = x.reshape(-1, x.shape[-1])
             # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-            x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+            if nvfp4_batch_invariant_eligible(x):
+                x_fp4, x_blockscale = fp4_quantize(
+                    x,
+                    layer.input_global_scale,
+                    batch_invariant=True,
+                )
+            else:
+                x_fp4, x_blockscale = fp4_quantize(
+                    x,
+                    layer.input_global_scale,
+                )
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

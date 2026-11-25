@@ -364,11 +364,24 @@ class DeepseekV2MLP(nn.Module):
             from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 nvfp4_gemm_swiglu_nvfp4_quant,
             )
-            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
-            x_fp4, x_scale = fp4_quantize(
-                x, self.gate_up_proj.input_scale_inv, enable_pdl=True
+            from sglang.srt.layers.quantization.fp4_utils import (
+                fp4_quantize,
+                nvfp4_batch_invariant_eligible,
             )
+
+            if nvfp4_batch_invariant_eligible(x):
+                x_fp4, x_scale = fp4_quantize(
+                    x,
+                    self.gate_up_proj.input_scale_inv,
+                    enable_pdl=True,
+                    batch_invariant=True,
+                )
+            else:
+                x_fp4, x_scale = fp4_quantize(
+                    x,
+                    self.gate_up_proj.input_scale_inv,
+                    enable_pdl=True,
+                )
             out_fp4, out_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fp4,
                 x_scale,
@@ -919,6 +932,7 @@ class DeepseekV2MoE(nn.Module):
             # [Up, Gate]-interleaved weight + scale.
             from sglang.srt.layers.quantization.fp4_utils import (
                 get_fp4_gemm_runner_backend,
+                use_flashinfer_bi_nvfp4,
             )
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
@@ -942,6 +956,11 @@ class DeepseekV2MoE(nn.Module):
                 and fc1_n % 128 == 0
                 and self.shared_experts.swiglu_limit is None
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                # The fused GEMM+SwiGLU+quant kernel is not one of the deterministic
+                # mode's batch-invariant kernels.
+                and not use_flashinfer_bi_nvfp4(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
